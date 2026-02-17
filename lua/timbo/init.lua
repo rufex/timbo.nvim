@@ -103,12 +103,41 @@ function M.file_stats()
   vim.notify(string.format("%s: %s", vim.fn.fnamemodify(file, ":t"), format_seconds(total)), vim.log.levels.INFO)
 end
 
+function M.project_stats()
+  local file = vim.api.nvim_buf_get_name(0)
+  local _, project = git_info(file)
+
+  if not project or project == "" then
+    vim.notify("Not in a git project", vim.log.levels.WARN)
+    return
+  end
+
+  local rows = db:eval(
+    "SELECT file, SUM(seconds) as total FROM time_entries WHERE project = :project GROUP BY file ORDER BY total DESC",
+    { project = project }
+  )
+
+  if not rows or #rows == 0 then
+    vim.notify("No data for current project", vim.log.levels.INFO)
+    return
+  end
+
+  local lines = { "Time spent per file in " .. vim.fn.fnamemodify(project, ":t") .. ":" }
+  for _, row in ipairs(rows) do
+    local relative = row.file:gsub("^" .. vim.pesc(project) .. "/", "")
+    table.insert(lines, string.format("  %-50s %s", relative, format_seconds(row.total)))
+  end
+
+  vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
+end
+
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
 
   init_db()
 
   vim.api.nvim_create_user_command("TimboCurrBuffAccum", M.file_stats, {})
+  vim.api.nvim_create_user_command("TimboCurrRepoAccum", M.project_stats, {})
 
   local group = vim.api.nvim_create_augroup("Timbo", { clear = true })
 
