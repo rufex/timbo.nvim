@@ -156,6 +156,22 @@ function M.setup(opts)
       start_tracking(args.file)
     end,
   })
+
+  vim.api.nvim_create_autocmd("FocusLost", {
+    group = group,
+    pattern = "*",
+    callback = function()
+      stop_tracking(vim.api.nvim_buf_get_name(0))
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("FocusGained", {
+    group = group,
+    pattern = "*",
+    callback = function()
+      start_tracking(vim.api.nvim_buf_get_name(0))
+    end,
+  })
 end
 
 return M
