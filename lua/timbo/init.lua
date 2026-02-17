@@ -77,10 +77,38 @@ local function stop_tracking(file)
   vim.notify(string.format("Time spent on %s: %.2f seconds", file, elapsed), vim.log.levels.DEBUG)
 end
 
+local function format_seconds(seconds)
+  local h = math.floor(seconds / 3600)
+  local m = math.floor((seconds % 3600) / 60)
+  local s = math.floor(seconds % 60)
+  if h > 0 then
+    return string.format("%dh %dm %ds", h, m, s)
+  elseif m > 0 then
+    return string.format("%dm %ds", m, s)
+  else
+    return string.format("%ds", s)
+  end
+end
+
+function M.file_stats()
+  local file = vim.api.nvim_buf_get_name(0)
+  if not is_trackable_file(file) then
+    vim.notify("Not a trackable file", vim.log.levels.WARN)
+    return
+  end
+
+  local rows = db:eval("SELECT SUM(seconds) as total FROM time_entries WHERE file = :file", { file = file })
+
+  local total = rows and rows[1] and rows[1].total or 0
+  vim.notify(string.format("%s: %s", vim.fn.fnamemodify(file, ":t"), format_seconds(total)), vim.log.levels.INFO)
+end
+
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
 
   init_db()
+
+  vim.api.nvim_create_user_command("TimboCurrBuffAccum", M.file_stats, {})
 
   local group = vim.api.nvim_create_augroup("Timbo", { clear = true })
 
