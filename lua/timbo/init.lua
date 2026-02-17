@@ -6,8 +6,18 @@ end
 
 local start_timers = {}
 
-local function start_tracking(file)
+local function is_trackable_file(file)
   if not file or file == "" then
+    return false
+  end
+  if file:find("://") then
+    return false
+  end
+  return true
+end
+
+local function start_tracking(file)
+  if not is_trackable_file(file) then
     return
   end
 
@@ -16,7 +26,7 @@ local function start_tracking(file)
 end
 
 local function stop_tracking(file)
-  if not file or file == "" then
+  if not is_trackable_file(file) then
     return
   end
 
