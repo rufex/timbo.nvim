@@ -1,10 +1,31 @@
 local M = {}
 
+local sqlite = require("sqlite")
+
 local function now()
   return vim.loop.hrtime() / 1e9
 end
 
+local config = {
+  db_path = vim.fn.stdpath("data") .. "/timbo.db",
+}
+
+local db
 local start_timers = {}
+
+local function init_db()
+  db = sqlite:open(config.db_path)
+  db:execute([[
+    CREATE TABLE IF NOT EXISTS time_entries (
+      id      INTEGER PRIMARY KEY AUTOINCREMENT,
+      project TEXT,
+      branch  TEXT,
+      file    TEXT,
+      seconds REAL NOT NULL,
+      timestamp INTEGER NOT NULL
+    )
+  ]])
+end
 
 local function is_trackable_file(file)
   if not file or file == "" then
@@ -14,6 +35,14 @@ local function is_trackable_file(file)
     return false
   end
   return true
+end
+
+local function git_info(file)
+  local dir = vim.fn.fnamemodify(file, ":h")
+  local escaped = vim.fn.shellescape(dir)
+  local branch = vim.trim(vim.fn.system("git -C " .. escaped .. " branch --show-current 2>/dev/null"))
+  local root = vim.trim(vim.fn.system("git -C " .. escaped .. " rev-parse --show-toplevel 2>/dev/null"))
+  return branch, root
 end
 
 local function start_tracking(file)
@@ -35,15 +64,24 @@ local function stop_tracking(file)
     return
   end
 
-  local end_time = now()
-  local elapsed_time = end_time - start_time
-
+  local elapsed = now() - start_time
   start_timers[file] = nil
 
-  vim.notify(string.format("Time spent on %s: %.2f seconds", file, elapsed_time), vim.log.levels.DEBUG)
+  local branch, project = git_info(file)
+
+  db:eval(
+    "INSERT INTO time_entries (project, branch, file, seconds, timestamp) VALUES(:project, :branch, :file, :seconds, :timestamp)",
+    { project = project, branch = branch, file = file, seconds = elapsed, timestamp = os.time() }
+  )
+
+  vim.notify(string.format("Time spent on %s: %.2f seconds", file, elapsed), vim.log.levels.DEBUG)
 end
 
-function M.setup()
+function M.setup(opts)
+  config = vim.tbl_deep_extend("force", config, opts or {})
+
+  init_db()
+
   local group = vim.api.nvim_create_augroup("Timbo", { clear = true })
 
   vim.api.nvim_create_autocmd("BufLeave", {
