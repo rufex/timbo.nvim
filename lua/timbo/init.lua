@@ -90,55 +90,184 @@ local function format_seconds(seconds)
   end
 end
 
-function M.file_stats()
-  local file = vim.api.nvim_buf_get_name(0)
-  if not is_trackable_file(file) then
-    vim.notify("Not a trackable file", vim.log.levels.WARN)
+local function date_to_timestamp(date_str, end_of_day)
+  local y, m, d = date_str:match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
+  return os.time({
+    year = tonumber(y),
+    month = tonumber(m),
+    day = tonumber(d),
+    hour = end_of_day and 23 or 0,
+    min = end_of_day and 59 or 0,
+    sec = end_of_day and 59 or 0,
+  })
+end
+
+local function parse_args(fargs)
+  local scope = fargs[1]
+  local valid_scopes = { file = true, files = true, total = true }
+  if not valid_scopes[scope] then
+    vim.notify("Timbo: invalid scope '" .. tostring(scope) .. "'. Use: file, files, total", vim.log.levels.ERROR)
+    return nil, nil
+  end
+
+  local filters = {}
+  local date_pat = "^%d%d%d%d%-%d%d%-%d%d$"
+
+  for i = 2, #fargs do
+    local key, value = fargs[i]:match("^(%w+)=(.+)$")
+    if key and value then
+      filters[key] = value
+    else
+      vim.notify("Timbo: unrecognized argument '" .. fargs[i] .. "'", vim.log.levels.WARN)
+    end
+  end
+
+  if filters.from and not filters.from:match(date_pat) then
+    vim.notify("Timbo: 'from' must be YYYY-MM-DD, got: " .. filters.from, vim.log.levels.ERROR)
+    return nil, nil
+  end
+  if filters.to and not filters.to:match(date_pat) then
+    vim.notify("Timbo: 'to' must be YYYY-MM-DD, got: " .. filters.to, vim.log.levels.ERROR)
+    return nil, nil
+  end
+
+  return scope, filters
+end
+
+local function build_query(scope, filters, project, file)
+  local conditions = { "project = :project" }
+  local params = { project = project }
+
+  if filters.branch then
+    table.insert(conditions, "branch = :branch")
+    params.branch = filters.branch
+  end
+
+  if filters.from then
+    table.insert(conditions, "timestamp >= :ts_from")
+    params.ts_from = date_to_timestamp(filters.from, false)
+  end
+
+  if filters.to then
+    table.insert(conditions, "timestamp <= :ts_to")
+    params.ts_to = date_to_timestamp(filters.to, true)
+  end
+
+  if scope == "file" then
+    table.insert(conditions, "file = :file")
+    params.file = file
+  end
+
+  local where = table.concat(conditions, " AND ")
+
+  local sql
+  if scope == "files" then
+    sql = "SELECT file, SUM(seconds) AS total FROM time_entries WHERE " .. where .. " GROUP BY file ORDER BY total DESC"
+  else
+    sql = "SELECT SUM(seconds) AS total FROM time_entries WHERE " .. where
+  end
+
+  return sql, params
+end
+
+local function format_results(scope, filters, project, rows)
+  local lines = {}
+
+  table.insert(lines, "Timbo — " .. vim.fn.fnamemodify(project, ":t"))
+  table.insert(lines, "Scope  : " .. scope)
+  table.insert(lines, "Branch : " .. (filters.branch or "(all)"))
+  if filters.from then
+    table.insert(lines, "From   : " .. filters.from)
+  end
+  if filters.to then
+    table.insert(lines, "To     : " .. filters.to)
+  end
+  table.insert(lines, string.rep("─", 60))
+  table.insert(lines, "")
+
+  if scope == "files" then
+    if not rows or #rows == 0 then
+      table.insert(lines, "(no data)")
+    else
+      local max_len = 0
+      for _, row in ipairs(rows) do
+        local rel = row.file:gsub("^" .. vim.pesc(project) .. "/", "")
+        if #rel > max_len then
+          max_len = #rel
+        end
+      end
+      max_len = math.min(max_len, 60)
+      for _, row in ipairs(rows) do
+        local rel = row.file:gsub("^" .. vim.pesc(project) .. "/", "")
+        table.insert(lines, string.format("  %-" .. max_len .. "s  %s", rel, format_seconds(row.total or 0)))
+      end
+    end
+  else
+    local total = rows and rows[1] and rows[1].total or 0
+    table.insert(lines, "Total: " .. format_seconds(total))
+  end
+
+  return lines
+end
+
+local function open_scratch_buffer(lines)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = "wipe"
+  vim.cmd("split")
+  vim.api.nvim_win_set_buf(vim.api.nvim_get_current_win(), buf)
+  vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, noremap = true, silent = true })
+end
+
+local function timbo_command(opts)
+  local scope, filters = parse_args(opts.fargs)
+  if not scope then
     return
   end
 
-  local rows = db:eval("SELECT SUM(seconds) as total FROM time_entries WHERE file = :file", { file = file })
-
-  local total = rows and rows[1] and rows[1].total or 0
-  vim.notify(string.format("%s: %s", vim.fn.fnamemodify(file, ":t"), format_seconds(total)), vim.log.levels.INFO)
-end
-
-function M.project_stats()
   local file = vim.api.nvim_buf_get_name(0)
-  local _, project = git_info(file)
+  local current_branch, project = git_info(file)
 
   if not project or project == "" then
-    vim.notify("Not in a git project", vim.log.levels.WARN)
+    vim.notify("Timbo: not inside a git project", vim.log.levels.ERROR)
     return
   end
 
-  local rows = db:eval(
-    "SELECT file, SUM(seconds) as total FROM time_entries WHERE project = :project GROUP BY file ORDER BY total DESC",
-    { project = project }
-  )
+  if filters.branch == "." then
+    filters.branch = current_branch
+  end
 
-  if not rows or #rows == 0 then
-    vim.notify("No data for current project", vim.log.levels.INFO)
+  if scope == "file" and not is_trackable_file(file) then
+    vim.notify("Timbo: current buffer is not a trackable file", vim.log.levels.WARN)
     return
   end
 
-  local lines = { "Time spent per file in " .. vim.fn.fnamemodify(project, ":t") .. ":" }
-  for _, row in ipairs(rows) do
-    local relative = row.file:gsub("^" .. vim.pesc(project) .. "/", "")
-    table.insert(lines, string.format("  %-50s %s", relative, format_seconds(row.total)))
-  end
-
-  vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
+  local sql, params = build_query(scope, filters, project, file)
+  local rows = db:eval(sql, params)
+  local lines = format_results(scope, filters, project, rows)
+  open_scratch_buffer(lines)
 end
 
-function M.setup(opts)
-  config = vim.tbl_deep_extend("force", config, opts or {})
+local function register_user_commands()
+  vim.api.nvim_create_user_command("Timbo", timbo_command, {
+    nargs = "+",
+    desc = ":Timbo <file|files|total> [branch=X] [from=YYYY-MM-DD] [to=YYYY-MM-DD]",
+    complete = function(arglead, cmdline, _)
+      local tokens = vim.split(cmdline, "%s+")
+      if #tokens <= 2 then
+        return vim.tbl_filter(function(s)
+          return s:find("^" .. arglead) ~= nil
+        end, { "file", "files", "total" })
+      end
+      return vim.tbl_filter(function(s)
+        return s:find("^" .. arglead) ~= nil
+      end, { "branch=", "from=", "to=" })
+    end,
+  })
+end
 
-  init_db()
-
-  vim.api.nvim_create_user_command("TimboCurrBuffAccum", M.file_stats, {})
-  vim.api.nvim_create_user_command("TimboCurrRepoAccum", M.project_stats, {})
-
+local function register_event_listeners()
   local group = vim.api.nvim_create_augroup("Timbo", { clear = true })
 
   vim.api.nvim_create_autocmd("BufLeave", {
@@ -172,6 +301,13 @@ function M.setup(opts)
       start_tracking(vim.api.nvim_buf_get_name(0))
     end,
   })
+end
+
+function M.setup(opts)
+  config = vim.tbl_deep_extend("force", config, opts or {})
+  init_db()
+  register_user_commands()
+  register_event_listeners()
 end
 
 return M
