@@ -1,6 +1,6 @@
-local M = {}
+local DB = require("timbo.db")
 
-local sqlite = require("sqlite")
+local M = {}
 
 local function now()
   return vim.loop.hrtime() / 1e9
@@ -10,22 +10,7 @@ local config = {
   db_path = vim.fn.stdpath("data") .. "/timbo.db",
 }
 
-local db
 local start_timers = {}
-
-local function init_db()
-  db = sqlite:open(config.db_path)
-  db:execute([[
-    CREATE TABLE IF NOT EXISTS time_entries (
-      id      INTEGER PRIMARY KEY AUTOINCREMENT,
-      project TEXT,
-      branch  TEXT,
-      file    TEXT,
-      seconds REAL NOT NULL,
-      timestamp INTEGER NOT NULL
-    )
-  ]])
-end
 
 local function is_trackable_file(file)
   if not file or file == "" then
@@ -69,10 +54,7 @@ local function stop_tracking(file)
 
   local branch, project = git_info(file)
 
-  db:eval(
-    "INSERT INTO time_entries (project, branch, file, seconds, timestamp) VALUES(:project, :branch, :file, :seconds, :timestamp)",
-    { project = project, branch = branch, file = file, seconds = elapsed, timestamp = os.time() }
-  )
+  DB.insert_entry(project, branch, file, elapsed)
 
   vim.notify(string.format("Time spent on %s: %.2f seconds", file, elapsed), vim.log.levels.DEBUG)
 end
@@ -88,18 +70,6 @@ local function format_seconds(seconds)
   else
     return string.format("%ds", s)
   end
-end
-
-local function date_to_timestamp(date_str, end_of_day)
-  local y, m, d = date_str:match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
-  return os.time({
-    year = tonumber(y),
-    month = tonumber(m),
-    day = tonumber(d),
-    hour = end_of_day and 23 or 0,
-    min = end_of_day and 59 or 0,
-    sec = end_of_day and 59 or 0,
-  })
 end
 
 local function parse_args(fargs)
@@ -132,42 +102,6 @@ local function parse_args(fargs)
   end
 
   return scope, filters
-end
-
-local function build_query(scope, filters, project, file)
-  local conditions = { "project = :project" }
-  local params = { project = project }
-
-  if filters.branch then
-    table.insert(conditions, "branch = :branch")
-    params.branch = filters.branch
-  end
-
-  if filters.from then
-    table.insert(conditions, "timestamp >= :ts_from")
-    params.ts_from = date_to_timestamp(filters.from, false)
-  end
-
-  if filters.to then
-    table.insert(conditions, "timestamp <= :ts_to")
-    params.ts_to = date_to_timestamp(filters.to, true)
-  end
-
-  if scope == "file" then
-    table.insert(conditions, "file = :file")
-    params.file = file
-  end
-
-  local where = table.concat(conditions, " AND ")
-
-  local sql
-  if scope == "files" then
-    sql = "SELECT file, SUM(seconds) AS total FROM time_entries WHERE " .. where .. " GROUP BY file ORDER BY total DESC"
-  else
-    sql = "SELECT SUM(seconds) AS total FROM time_entries WHERE " .. where
-  end
-
-  return sql, params
 end
 
 local function format_results(scope, filters, project, rows)
@@ -243,8 +177,7 @@ local function timbo_command(opts)
     return
   end
 
-  local sql, params = build_query(scope, filters, project, file)
-  local rows = db:eval(sql, params)
+  local rows = DB.query(scope, filters, project, file)
   local lines = format_results(scope, filters, project, rows)
   open_scratch_buffer(lines)
 end
@@ -305,7 +238,8 @@ end
 
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
-  init_db()
+  DB.init(config.db_path)
+
   register_user_commands()
   register_event_listeners()
 end
